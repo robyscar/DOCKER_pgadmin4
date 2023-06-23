@@ -69,22 +69,9 @@ const copyFiles = new CopyPlugin({
     pgadminThemesJson,
     {
       from: './pgadmin/static/scss/resources/**/*.png',
-      to: 'img/[name].[ext]',
+      to: 'img/[name][ext]',
     },
   ],
-});
-
-const imageMinimizer = new ImageMinimizerPlugin({
-  test: /\.(jpe?g|png|gif)$/i,
-  minimizerOptions: {
-    // Lossless optimization with custom option
-    // Feel free to experiment with options for better result for you
-    plugins: [
-      ['mozjpeg', { progressive: true }],
-      ['optipng', { optimizationLevel: 7 }],
-      ['pngquant', {quality: [0.75, .9], speed: 3}],
-    ],
-  },
 });
 
 function cssToBeSkiped(curr_path) {
@@ -577,7 +564,7 @@ module.exports = [{
     ignored: /node_modules/,
   },
   optimization: {
-    minimizer: [
+    minimizer: PRODUCTION ? [
       new TerserPlugin({
         parallel: true,
         extractComments: true,
@@ -585,7 +572,20 @@ module.exports = [{
           compress: true,
         },
       }),
-    ],
+      new ImageMinimizerPlugin({
+        test: /\.(jpe?g|png|gif)$/i,
+        minimizer: {
+          implementation: ImageMinimizerPlugin.imageminMinify,
+          options: {
+            plugins: [
+              ['mozjpeg', { progressive: true }],
+              ['optipng', { optimizationLevel: 7 }],
+              ['pngquant', {quality: [0.75, .9], speed: 3}],
+            ],
+          },
+        },
+      }),
+    ] : [],
     splitChunks: {
       cacheGroups: {
         vendor_main: {
@@ -645,7 +645,6 @@ module.exports = [{
     sourceMapDevToolPlugin,
     bundleAnalyzer,
     copyFiles,
-    imageMinimizer,
   ]: [
     extractStyle,
     providePlugin,

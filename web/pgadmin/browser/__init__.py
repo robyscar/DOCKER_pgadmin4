@@ -11,14 +11,18 @@ import json
 import logging
 import os
 import sys
-from abc import ABCMeta, abstractmethod, abstractproperty
+from abc import ABCMeta, abstractmethod
 from smtplib import SMTPConnectError, SMTPResponseException, \
     SMTPServerDisconnected, SMTPDataError, SMTPHeloError, SMTPException, \
     SMTPAuthenticationError, SMTPSenderRefused, SMTPRecipientsRefused
 from socket import error as SOCKETErrorException
 from urllib.request import urlopen
+from pgadmin.utils.constants import KEY_RING_SERVICE_NAME, \
+    KEY_RING_USERNAME_FORMAT, KEY_RING_DESKTOP_USER, KEY_RING_TUNNEL_FORMAT
 
 import time
+
+import keyring
 from flask import current_app, render_template, url_for, make_response, \
     flash, Response, request, after_this_request, redirect, session
 from flask_babel import gettext
@@ -31,7 +35,7 @@ from flask_security.recoverable import reset_password_token_status, \
     generate_reset_password_token, update_password
 from flask_security.signals import reset_password_instructions_sent
 from flask_security.utils import config_value, do_flash, get_url, \
-    get_message, slash_url_suffix, login_user, send_mail, logout_user, \
+    get_message, slash_url_suffix, login_user, send_mail, \
     get_post_logout_redirect
 from flask_security.views import _security, view_commit, _ctx
 from werkzeug.datastructures import MultiDict
@@ -51,11 +55,12 @@ from pgadmin.browser.register_browser_preferences import \
 from pgadmin.utils.master_password import validate_master_password, \
     set_masterpass_check_text, cleanup_master_password, get_crypt_key, \
     set_crypt_key, process_masterpass_disabled
-from pgadmin.model import User
+from pgadmin.model import User, db
 from pgadmin.utils.constants import MIMETYPE_APP_JS, PGADMIN_NODE,\
     INTERNAL, KERBEROS, LDAP, QT_DEFAULT_PLACEHOLDER, OAUTH2, WEBSERVER,\
     VW_EDT_DEFAULT_PLACEHOLDER
 from pgadmin.authenticate import AuthSourceManager
+from pgadmin.utils.exception import CryptKeyMissing
 
 try:
     from flask_security.views import default_render_json
@@ -741,11 +746,15 @@ def get_nodes():
     return make_json_response(data=nodes)
 
 
-def form_master_password_response(existing=True, present=False, errmsg=None):
+def form_master_password_response(existing=True, present=False, errmsg=None,
+                                  keyring_name='',
+                                  invalid_master_password_hook=False):
     return make_json_response(data={
         'present': present,
         'reset': existing,
         'errmsg': errmsg,
+        'keyring_name': keyring_name,
+        'invalid_master_password_hook': invalid_master_password_hook,
         'is_error': True if errmsg else False
     })
 
@@ -780,8 +789,19 @@ def reset_master_password():
     Removes the master password and remove all saved passwords
     This password will be used to encrypt/decrypt saved server passwords
     """
+    if not config.DISABLED_LOCAL_PASSWORD_STORAGE:
+        # This is to set the Desktop user password so it will not ask for
+        # migrate exiting passwords as those are getting cleared
+        keyring.set_password(KEY_RING_SERVICE_NAME,
+                             KEY_RING_DESKTOP_USER.format(
+                                 current_user.username), 'test')
     cleanup_master_password()
-    return make_json_response(data=get_crypt_key()[0])
+    status, crypt_key = get_crypt_key()
+    # Set masterpass_check if MASTER_PASSWORD_HOOK is set which provides
+    # encryption key
+    if config.MASTER_PASSWORD_REQUIRED and config.MASTER_PASSWORD_HOOK:
+        set_masterpass_check_text(crypt_key)
+    return make_json_response(data=status)
 
 
 @blueprint.route("/master_password", endpoint="set_master_password",
@@ -804,9 +824,133 @@ def set_master_password():
         if data != '':
             data = json.loads(data)
 
-    # Master password is not applicable for server mode
-    # Enable master password if oauth is used
-    if not config.SERVER_MODE or OAUTH2 in config.AUTHENTICATION_SOURCES \
+    if not config.DISABLED_LOCAL_PASSWORD_STORAGE and \
+            (config.ALLOW_SAVE_PASSWORD or config.ALLOW_SAVE_TUNNEL_PASSWORD):
+        if data.get('password') and config.MASTER_PASSWORD_REQUIRED and\
+                not validate_master_password(data.get('password')):
+            return form_master_password_response(
+                present=False,
+                keyring_name=config.KEYRING_NAME,
+                errmsg=gettext("Incorrect master password")
+            )
+        from pgadmin.model import Server
+        from pgadmin.utils.crypto import decrypt
+        desktop_user = current_user
+
+        enc_key = data['password']
+        if not config.MASTER_PASSWORD_REQUIRED:
+            status, enc_key = get_crypt_key()
+            if not status:
+                raise CryptKeyMissing
+
+        try:
+            all_server = Server.query.all()
+            # pgAdmin will use the OS password manager to store the server
+            # password, here migrating the existing saved server password to
+            # OS password manager
+            if keyring.get_password(
+                    KEY_RING_SERVICE_NAME, KEY_RING_DESKTOP_USER.format(
+                        desktop_user.username)) or enc_key:
+                is_migrated = False
+
+                for server in all_server:
+                    if enc_key:
+                        if server.password and config.ALLOW_SAVE_PASSWORD \
+                                and server.save_password:
+                            name = KEY_RING_USERNAME_FORMAT.format(server.name,
+                                                                   server.id)
+                            password = decrypt(server.password,
+                                               enc_key).decode()
+                            # Store the password using OS password manager
+                            keyring.set_password(KEY_RING_SERVICE_NAME, name,
+                                                 password)
+                            is_migrated = True
+                            setattr(server, 'password', None)
+
+                        if server.tunnel_password and \
+                                config.ALLOW_SAVE_TUNNEL_PASSWORD:
+                            tname = KEY_RING_TUNNEL_FORMAT.format(server.name,
+                                                                  server.id)
+                            tpassword = decrypt(server.tunnel_password,
+                                                enc_key).decode()
+                            # Store the password using OS password manager
+                            keyring.set_password(KEY_RING_SERVICE_NAME, tname,
+                                                 tpassword)
+                            is_migrated = True
+                            setattr(server, 'tunnel_password', None)
+
+                db.session.commit()
+
+                # Store the password using OS password manager
+                keyring.set_password(KEY_RING_SERVICE_NAME,
+                                     KEY_RING_DESKTOP_USER.format(
+                                         desktop_user.username), 'test')
+                return form_master_password_response(
+                    existing=True,
+                    present=True,
+                    keyring_name=config.KEYRING_NAME if is_migrated else ''
+                )
+            else:
+                if len(all_server) == 0:
+                    # Store the password using OS password manager
+                    keyring.set_password(KEY_RING_SERVICE_NAME,
+                                         KEY_RING_DESKTOP_USER.format(
+                                             desktop_user.username), 'test')
+                    return form_master_password_response(
+                        present=True,
+                    )
+                else:
+                    is_master_password_present = True
+                    keyring_name = ''
+                    for server in all_server:
+                        is_password_present = \
+                            server.save_password or server.tunnel_password
+                        if server.password and is_password_present:
+                            is_master_password_present = False
+                            keyring_name = config.KEYRING_NAME
+                            break
+
+                    if is_master_password_present:
+                        # Store the password using OS password manager
+                        keyring.set_password(KEY_RING_SERVICE_NAME,
+                                             KEY_RING_DESKTOP_USER.format(
+                                                 desktop_user.username),
+                                             'test')
+
+                    return form_master_password_response(
+                        present=is_master_password_present,
+                        keyring_name=keyring_name
+                    )
+        except Exception as e:
+            current_app.logger.warning(
+                'Fail set password using OS password manager'
+                ', fallback to master password. Error: {0}'.format(e)
+            )
+            config.DISABLED_LOCAL_PASSWORD_STORAGE = True
+
+    # If the master password is required and the master password hook
+    # is specified then try to retrieve the encryption key and update data.
+    # If there is an error while retrieving it, return an error message.
+    if config.SERVER_MODE and config.MASTER_PASSWORD_REQUIRED and \
+            config.MASTER_PASSWORD_HOOK:
+        status, enc_key = get_crypt_key()
+        if status:
+            data = {'password': enc_key, 'submit_password': True}
+        else:
+            error = gettext('The master password could not be retrieved from '
+                            'the MASTER_PASSWORD_HOOK utility specified {0}.'
+                            'Please check that the hook utility is configured'
+                            ' correctly.'.format(config.MASTER_PASSWORD_HOOK))
+            return form_master_password_response(
+                existing=False,
+                present=False,
+                errmsg=error,
+                invalid_master_password_hook=True
+            )
+
+    # Master password is applicable for Desktop mode and in server mode
+    # only when auth sources are oauth, kerberos, webserver.
+    if (not config.SERVER_MODE) or OAUTH2 in config.AUTHENTICATION_SOURCES \
         or KERBEROS in config.AUTHENTICATION_SOURCES \
         or WEBSERVER in config.AUTHENTICATION_SOURCES \
             and config.MASTER_PASSWORD_REQUIRED:
@@ -814,12 +958,18 @@ def set_master_password():
         if current_user.masterpass_check is not None and \
             data.get('submit_password', False) and \
                 not validate_master_password(data.get('password')):
+            errmsg = '' if config.MASTER_PASSWORD_HOOK \
+                else gettext("Incorrect master password")
+            invalid_master_password_hook = \
+                True if config.MASTER_PASSWORD_HOOK else False
             return form_master_password_response(
                 existing=True,
                 present=False,
-                errmsg=gettext("Incorrect master password")
+                errmsg=errmsg,
+                invalid_master_password_hook=invalid_master_password_hook
             )
 
+        # if master password received in request
         if data != '' and data.get('password', '') != '':
 
             # store the master pass in the memory
@@ -840,16 +990,23 @@ def set_master_password():
             # master pass
             set_masterpass_check_text(data.get('password'))
 
+        # If password in request is empty then try to get it with
+        # get_crypt_key method. If get_crypt_key() returns false status and
+        # masterpass_check is already set, provide a pop to enter
+        # master password(present) without the reset option.(existing).
         elif not get_crypt_key()[0] and \
                 current_user.masterpass_check is not None:
             return form_master_password_response(
                 existing=True,
                 present=False,
             )
+
+        # If get_crypt_key return True,but crypt_key is none and
+        # user entered blank password, return error message.
         elif not get_crypt_key()[1]:
             error_message = None
+            # If user attempted to enter a blank password, then throw error
             if data.get('submit_password') and data.get('password') == '':
-                # If user attempted to enter a blank password, then throw error
                 error_message = gettext("Master password cannot be empty")
             return form_master_password_response(
                 existing=False,

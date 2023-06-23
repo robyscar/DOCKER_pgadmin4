@@ -88,6 +88,10 @@ export class ResultSetUtils {
     return msg;
   }
 
+  static isCursorInitialised(httpMessage) {
+    return httpMessage.data.data.status === 'NotInitialised';
+  }
+
   static isQueryFinished(httpMessage) {
     return httpMessage.data.data.status === 'Success';
   }
@@ -302,7 +306,10 @@ export class ResultSetUtils {
       if(httpMessage.data.data.notifies) {
         this.eventBus.fireEvent(QUERY_TOOL_EVENTS.PUSH_NOTICE, httpMessage.data.data.notifies);
       }
-      if (ResultSetUtils.isQueryFinished(httpMessage)) {
+
+      if (ResultSetUtils.isCursorInitialised(httpMessage)) {
+        return Promise.resolve(this.pollForResult(onResultsAvailable, onExplain, onPollError));
+      } else if (ResultSetUtils.isQueryFinished(httpMessage)) {
         this.setEndTime(new Date());
         msg = this.queryFinished(httpMessage, onResultsAvailable, onExplain);
       } else if (ResultSetUtils.isQueryStillRunning(httpMessage)) {
@@ -492,9 +499,9 @@ export class ResultSetUtils {
     case '"char"[]':
     case 'character varying':
     case 'character varying[]':
-      if (c.internal_size && c.internal_size >= 0 && c.internal_size != 65535) {
+      if (c.display_size && c.display_size >= 0 && c.display_size != 65535) {
         // Update column type to display length on column header
-        columnType += ' (' + c.internal_size + ')';
+        columnType += ' (' + c.display_size + ')';
       }
       cellType = 'string';
       break;
@@ -828,8 +835,8 @@ export function ResultSet() {
     };
 
     const executeAndPoll = async ()=>{
-      let goForPoll = await yesCallback();
-      if (goForPoll) pollCallback();
+      yesCallback();
+      pollCallback();
     };
 
     if(isDataChanged()) {
@@ -949,16 +956,30 @@ export function ResultSet() {
 
   const fetchMoreRows = async (all=false, callback=undefined)=>{
     if(queryData.has_more_rows) {
+      let res = [];
       setIsLoadingMore(true);
-      const res = await rsu.current.getMoreRows(all);
-      const newRows = rsu.current.processRows(res.data.data.result, columns);
-      setRows((prevRows)=>[...prevRows, ...newRows]);
-      setQueryData((prev)=>({
-        ...prev,
-        has_more_rows: res.data.data.has_more_rows,
-        rows_fetched_to: res.data.data.rows_fetched_to!=0 ? res.data.data.rows_fetched_to : prev.rows_fetched_to,
-      }));
-      setIsLoadingMore(false);
+      try {
+        res = await rsu.current.getMoreRows(all);
+        const newRows = rsu.current.processRows(res.data.data.result, columns);
+        setRows((prevRows)=>[...prevRows, ...newRows]);
+        setQueryData((prev)=>({
+          ...prev,
+          has_more_rows: res.data.data.has_more_rows,
+          rows_fetched_to: res.data.data.rows_fetched_to!=0 ? res.data.data.rows_fetched_to : prev.rows_fetched_to,
+        }));
+      } catch (e) {
+        eventBus.fireEvent(QUERY_TOOL_EVENTS.HANDLE_API_ERROR,
+          e,
+          {
+            connectionLostCallback: ()=>{
+              eventBus.fireEvent(QUERY_TOOL_EVENTS.EXECUTION_START, rsu.current.query, null, false, true);
+            },
+            checkTransaction: true,
+          }
+        );
+      } finally {
+        setIsLoadingMore(false);
+      }
     }
     callback?.();
   };

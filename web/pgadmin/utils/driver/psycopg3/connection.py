@@ -263,10 +263,19 @@ class Connection(BaseConnection):
                 return True, None
 
         manager = self.manager
-        crypt_key_present, crypt_key = get_crypt_key()
 
-        password, encpass, is_update_password = self._check_user_password(
-            kwargs)
+        if config.DISABLED_LOCAL_PASSWORD_STORAGE:
+            crypt_key_present, crypt_key = get_crypt_key()
+
+            if not crypt_key_present:
+                raise CryptKeyMissing()
+
+            password, encpass, is_update_password = self._check_user_password(
+                kwargs)
+        else:
+            password = None
+            encpass = kwargs['password'] if 'password' in kwargs else None
+            is_update_password = True
 
         passfile = kwargs['passfile'] if 'passfile' in kwargs else None
         tunnel_password = kwargs['tunnel_password'] if 'tunnel_password' in \
@@ -292,13 +301,15 @@ class Connection(BaseConnection):
         if self.reconnecting is not False:
             self.password = None
 
-        if not crypt_key_present:
-            raise CryptKeyMissing()
-
-        is_error, errmsg, password = self._decode_password(encpass, manager,
-                                                           password, crypt_key)
-        if is_error:
-            return False, errmsg
+        if config.DISABLED_LOCAL_PASSWORD_STORAGE:
+            is_error, errmsg, password = self._decode_password(encpass,
+                                                               manager,
+                                                               password,
+                                                               crypt_key)
+            if is_error:
+                return False, errmsg
+        else:
+            password = encpass
 
         # If no password credential is found then connect request might
         # come from Query tool, ViewData grid, debugger etc tools.
@@ -420,6 +431,7 @@ class Connection(BaseConnection):
         """
         is_set_role = False
         role = None
+        status = None
 
         if 'role' in kwargs and kwargs['role']:
             is_set_role = True
@@ -429,7 +441,16 @@ class Connection(BaseConnection):
             role = manager.role
 
         if is_set_role:
-            status = self._execute(cur, "SET ROLE TO {0}".format(role))
+            _query = "SELECT rolname from pg_roles WHERE rolname = '{0}'" \
+                     "".format(role)
+            _status, res = self.execute_scalar(_query)
+
+            if res:
+                status = self._execute(cur, "SET ROLE TO {0}".format(role))
+            else:
+                # If role is not found then set the status to role
+                # for showing the proper error message
+                status = role
 
             if status is not None:
                 self.conn.close()
@@ -437,7 +458,7 @@ class Connection(BaseConnection):
                 current_app.logger.error(
                     "Connect to the database server (#{server_id}) for "
                     "connection ({conn_id}), but - failed to setup the role "
-                    "with error message as below:{msg}".format(
+                    " {msg}".format(
                         server_id=self.manager.sid,
                         conn_id=conn_id,
                         msg=status
@@ -445,7 +466,7 @@ class Connection(BaseConnection):
                 )
                 return True, \
                     _(
-                        "Failed to setup the role with error message:\n{0}"
+                        "Failed to setup the role \n{0}"
                     ).format(status)
         return False, ''
 
@@ -647,7 +668,7 @@ WHERE db.datname = current_database()""")
 
     def __cursor(self, server_cursor=False, scrollable=False):
 
-        if not get_crypt_key()[0]:
+        if not get_crypt_key()[0] and config.SERVER_MODE:
             raise CryptKeyMissing()
 
         # Check SSH Tunnel is alive or not. If used by the database
@@ -779,14 +800,12 @@ WHERE db.datname = current_database()""")
         query = query.encode(self.python_encoding)
         cur.execute(query, params)
 
-    def execute_on_server_as_csv(self, formatted_exception_msg=False,
-                                 records=2000):
+    def execute_on_server_as_csv(self, records=2000):
         """
         To fetch query result and generate CSV output
 
         Args:
             params: Additional parameters
-            formatted_exception_msg: For exception
             records: Number of initial records
         Returns:
             Generator response
@@ -990,7 +1009,7 @@ WHERE db.datname = current_database()""")
         # If multiple queries are run, make sure to reach
         # the last query result
         while cur.nextset():
-            pass
+            pass  # This loop is empty
 
         self.row_count = cur.get_rowcount()
         if cur.get_rowcount() > 0:
@@ -1333,6 +1352,11 @@ WHERE db.datname = current_database()""")
             self.conn = None
         return False
 
+    def async_cursor_initialised(self):
+        if self.__async_cursor:
+            return True
+        return False
+
     def _decrypt_password(self, manager):
         """
         Decrypt password
@@ -1423,10 +1447,10 @@ Failed to reset the connection to the server due to following error:
         asyncio.run(_close_conn(self.conn))
 
     def _wait(self, conn):
-        pass
+        pass  # This function is empty
 
     def _wait_timeout(self, conn):
-        pass
+        pass  # This function is empty
 
     def poll(self, formatted_exception_msg=False, no_result=False):
         cur = self.__async_cursor
@@ -1453,9 +1477,8 @@ Failed to reset the connection to the server due to following error:
         while more_result:
             if not self.conn.pgconn.is_busy():
                 if cur.description is not None:
-                    for desc in cur.ordered_description():
-                        self.column_info = [desc.to_dict() for
-                                            desc in cur.ordered_description()]
+                    self.column_info = [desc.to_dict() for
+                                        desc in cur.ordered_description()]
 
                     pos = 0
                     if self.column_info:
@@ -1537,13 +1560,13 @@ Failed to reset the connection to the server due to following error:
                 user = User.query.filter_by(id=current_user.id).first()
                 if user is None:
                     return False, self.UNAUTHORIZED_REQUEST
+                if config.DISABLED_LOCAL_PASSWORD_STORAGE:
+                    crypt_key_present, crypt_key = get_crypt_key()
+                    if not crypt_key_present:
+                        return False, crypt_key
 
-                crypt_key_present, crypt_key = get_crypt_key()
-                if not crypt_key_present:
-                    return False, crypt_key
-
-                password = decrypt(password, crypt_key)\
-                    .decode()
+                    password = decrypt(password, crypt_key)\
+                        .decode()
 
             try:
                 with ConnectionLocker(self.manager.kerberos_conn):
